@@ -12,7 +12,7 @@ Agent skills collection for AMD hardware development workflows.
 ```bash
 cd /path/to/your/project
 git submodule add https://github.com/Arist12/AMD-Skills.git .claude/skills
-git commit -m "Add AMD Skills submodule"
+git commit -m "feat: add AMD Skills submodule"
 ```
 
 This places the contents of AMD-Skills directly into `.claude/skills/`.
