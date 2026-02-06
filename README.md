@@ -4,6 +4,7 @@ Agent skills collection for AMD hardware development workflows.
 
 ## Available Skills
 
+- **amd-porting-optimization**: Port NVIDIA-only PyTorch repos to AMD ROCm, optimize with AMD-specific kernels, and benchmark
 - **rocprofv3-profiler**: Profile AMD GPU kernels and analyze performance bottlenecks
 
 ## Usage as Git Submodule
