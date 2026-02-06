@@ -2,17 +2,33 @@
 name: amd-porting-optimization
 description: >
   Port NVIDIA-only PyTorch repositories to AMD ROCm GPUs, optimize performance with
-  AMD-specific kernels, and write benchmarks to validate correctness and speedup.
+  AMD-specific kernels, and benchmark iteratively to validate correctness and speedup.
   Use this skill when the user wants to: (1) make an NVIDIA-only codebase run on AMD GPUs,
   (2) optimize PyTorch code for AMD MI-series GPUs (MI100/MI200/MI300/MI350),
   (3) write benchmarks comparing eager vs optimized performance on AMD hardware.
-  Covers the full workflow: compatibility porting, attention kernel optimization,
-  Triton kernel fusion, projection fusion, torch.compile tuning, and benchmark scripting.
+  Follows an iterative workflow: port -> benchmark baseline -> optimize -> re-benchmark -> iterate.
 ---
 
 # AMD GPU Porting & Optimization for PyTorch Repositories
 
-A three-phase workflow for porting NVIDIA-only PyTorch codebases to AMD ROCm GPUs and optimizing performance.
+An iterative workflow for porting NVIDIA-only PyTorch codebases to AMD ROCm GPUs and optimizing performance.
+
+## Workflow Overview
+
+```
+Phase 1: Port (Make It Run)
+    |
+    v
+Phase 2: Benchmark Baseline (Measure It)
+    |
+    v
+Phase 3: Optimize (Make It Fast) ----+
+    |                                 |
+    v                                 |
+Phase 4: Re-benchmark (Prove It) ----+  (iterate)
+```
+
+The key principle: **always measure before and after**. Write benchmark scripts first to establish a baseline, then optimize, then re-benchmark to quantify improvement. Iterate until satisfied.
 
 ---
 
@@ -36,7 +52,7 @@ torch.cuda.memory_allocated()   # Reports AMD GPU memory
 
 ### 1.2 Porting Checklist
 
-Search the codebase for each of these categories and apply fixes:
+Search the codebase for each category and apply fixes:
 
 #### A. Vendor-Specific Libraries
 
@@ -62,11 +78,6 @@ grep -rn "pynvml\|nvidia_smi\|nvml\|from flash_attn\|import apex" src/
 | `NCCL_*` | `NCCL_*` or `RCCL_*` | Collective communication (both work) |
 | `CUDA_LAUNCH_BLOCKING` | `HIP_LAUNCH_BLOCKING` | Sync kernel launches for debugging |
 
-Search patterns:
-```
-grep -rn "PYTORCH_CUDA_ALLOC_CONF\|CUDA_LAUNCH_BLOCKING\|NCCL_" src/
-```
-
 #### C. Backend-Specific Code
 
 | Pattern | Fix |
@@ -75,11 +86,6 @@ grep -rn "PYTORCH_CUDA_ALLOC_CONF\|CUDA_LAUNCH_BLOCKING\|NCCL_" src/
 | Hardcoded `torch.version.cuda` checks | Add `or torch.version.hip` alternative |
 | `torch.cuda.get_device_capability()` | Works on ROCm but returns different tuples; avoid gating on specific SM versions |
 | `dist.init_process_group(backend='nccl')` | No change needed (RCCL exposes as "nccl") |
-
-Search patterns:
-```
-grep -rn "cudnn\|torch.version.cuda\|get_device_capability\|sm_[0-9]" src/
-```
 
 #### D. Python Version Compatibility
 
@@ -119,13 +125,6 @@ def configure_memory_optimizations():
     elif vendor == "nvidia":
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
-
-def get_ddp_backend() -> str:
-    """Returns the appropriate DDP backend name."""
-    # RCCL is exposed as 'nccl' in PyTorch
-    if detect_gpu_vendor() != "none":
-        return "nccl"
-    return "gloo"
 ```
 
 ### 1.3 Validation
@@ -143,16 +142,10 @@ print(f"HIP version: {torch.version.hip}")
 
 # 2. Basic ops
 x = torch.randn(1024, 1024, dtype=torch.bfloat16, device="cuda")
-y = torch.matmul(x, x.T)  # Matrix multiply
+y = torch.matmul(x, x.T)
 assert not torch.isnan(y).any(), "NaN in matmul output"
 
-# 3. Autograd
-x.requires_grad_(True)
-loss = torch.matmul(x, x.T).sum()
-loss.backward()
-assert x.grad is not None, "Gradient computation failed"
-
-# 4. Model forward/backward
+# 3. Model forward/backward
 from torch import nn
 model = nn.TransformerEncoderLayer(d_model=512, nhead=8, batch_first=True).cuda().to(torch.bfloat16)
 inp = torch.randn(4, 128, 512, dtype=torch.bfloat16, device="cuda")
@@ -163,223 +156,13 @@ print("Basic validation PASSED")
 
 ---
 
-## Phase 2: Performance Optimization (Make It Fast)
+## Phase 2: Benchmark Baseline (Measure It)
 
-Goal: Achieve competitive or superior performance vs NVIDIA through AMD-specific kernel optimizations.
+Goal: Establish performance metrics **before any optimization**, so later improvements can be quantified.
 
-### Optimization Priority Order
+### 2.1 Precision Verification Script (Write First)
 
-Apply optimizations in this order (highest impact first):
-
-1. **torch.compile** - biggest single win, minimal code changes
-2. **Attention kernel replacement** - replaces the most expensive operation
-3. **Triton kernel fusion** - eliminates kernel launch overhead for elementwise ops
-4. **Projection fusion** - reduces GEMM count in attention and MLP
-5. **GEMM kernel tuning** - hardware-specific matrix multiply
-
-### 2.1 torch.compile Configuration
-
-This is the single highest-impact optimization. Configure it properly for AMD:
-
-```python
-import os
-import torch
-
-# Use reduce-overhead mode for inference (enables CUDA graphs)
-# Use max-autotune for training (longer compile, better kernels)
-compile_mode = os.environ.get("TORCH_COMPILE_MODE", "reduce-overhead")
-
-# Increase dynamo cache for models with dynamic shapes (KV cache, variable seq len)
-import torch._dynamo.config as dynamo_config
-dynamo_config.cache_size_limit = 64  # default is 8
-
-# Enable aggressive fusion in inductor
-import torch._inductor.config as inductor_config
-inductor_config.epilogue_fusion = True
-inductor_config.pattern_matcher = True
-inductor_config.aggressive_fusion = True
-
-# Apply to inference entry point
-model.inference_fn = torch.compile(model.inference_fn, mode=compile_mode)
-```
-
-**Key modes:**
-- `reduce-overhead`: Uses CUDA graphs, best for fixed-shape inference. 3-4x speedup typical.
-- `max-autotune`: Tries many kernel variants, best for training. Longer compile time.
-- `default`: Moderate optimization, fastest compile.
-
-### 2.2 Attention Kernel Optimization
-
-Replace PyTorch's generic attention with AMD-optimized flash attention from the `aiter` library:
-
-```python
-# Pattern: add aiter flash attention as a selectable backend
-
-# In the attention module (e.g., modeling_gemma.py):
-AITER_AVAILABLE = False
-try:
-    import aiter
-    AITER_AVAILABLE = True
-except ImportError:
-    pass
-
-USE_AITER_ATTENTION = os.environ.get("USE_AITER_ATTENTION", "0") == "1"
-
-def aiter_attention_forward(module, query, key, value, attention_mask, scaling, **kwargs):
-    """
-    Flash attention using aiter's AMD-optimized ASM kernels.
-
-    Supports: pure causal masks, full bidirectional (no mask), GQA.
-    Falls back to eager for: complex masks (padding, prefix-LM, cross-attention).
-    """
-    q_len, k_len = query.shape[2], key.shape[2]
-
-    # Cross-attention or KV cache: fall back to eager
-    if q_len != k_len:
-        return eager_attention_forward(module, query, key, value, attention_mask, scaling, **kwargs)
-
-    # Classify mask type
-    use_causal, can_use_flash = _classify_mask(attention_mask)
-    if not can_use_flash:
-        return eager_attention_forward(module, query, key, value, attention_mask, scaling, **kwargs)
-
-    # Expand KV heads for GQA
-    key = repeat_kv(key, module.num_key_value_groups)
-    value = repeat_kv(value, module.num_key_value_groups)
-
-    # Transpose to [batch, seq, heads, head_dim] for aiter
-    q = query.transpose(1, 2).contiguous()
-    k = key.transpose(1, 2).contiguous()
-    v = value.transpose(1, 2).contiguous()
-
-    result = aiter.flash_attn_func(q, k, v,
-        dropout_p=0.0,
-        softmax_scale=scaling,
-        causal=use_causal,
-        return_lse=True,
-    )
-    attn_output = result[0] if isinstance(result, tuple) else result
-    return attn_output, None
-```
-
-**Important constraints for aiter flash attention:**
-- Requires contiguous tensors in `[batch, seq, heads, head_dim]` layout
-- Only supports pure causal or full bidirectional masks
-- Must fall back to eager for padding masks, prefix-LM masks, cross-attention
-- `head_dim` must be supported by the hardware (commonly 64, 128, 256)
-
-### 2.3 Triton Kernel Fusion
-
-Write fused Triton kernels for frequently-used elementwise operations. These eliminate kernel launch overhead and reduce memory bandwidth by doing multiple operations in a single GPU kernel pass.
-
-**High-value targets (ordered by impact):**
-
-1. **RMSNorm** - replaces 5 ops (pow, mean, rsqrt, mul, mul) with 1 kernel
-2. **Fused GELU + Mul** - replaces 3 ops (gelu, slice, mul) with 1 kernel
-3. **Fused Add + RMSNorm** - combines residual addition with normalization
-4. **Fused SiLU + Mul** - alternative activation fusion
-
-See [references/triton_kernel_patterns.md](references/triton_kernel_patterns.md) for complete kernel implementations.
-
-**General Triton kernel pattern:**
-```python
-import triton
-import triton.language as tl
-
-@triton.jit
-def _fused_kernel(X_ptr, Y_ptr, stride, N, BLOCK_SIZE: tl.constexpr):
-    row = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < N
-    x = tl.load(X_ptr + row * stride + cols, mask=mask).to(tl.float32)
-    # ... fused computation in float32 ...
-    tl.store(Y_ptr + row * stride + cols, result.to(tl.bfloat16), mask=mask)
-
-def fused_op(x: torch.Tensor) -> torch.Tensor:
-    M, N = x.view(-1, x.shape[-1]).shape
-    y = torch.empty_like(x)
-    _fused_kernel[(M,)](x, y, x.stride(-2), N, BLOCK_SIZE=triton.next_power_of_2(N))
-    return y
-```
-
-**Design rules for Triton kernels:**
-- Compute in float32, store in bfloat16 (numerical stability)
-- BLOCK_SIZE must be a power of 2 and >= N
-- Always provide an eager fallback for when Triton is unavailable
-- Use environment variables to toggle optimized vs eager paths
-
-### 2.4 Projection Fusion
-
-Reduce kernel launch count by fusing separate linear projections into combined GEMMs:
-
-**QKV Fusion (3 GEMMs -> 1):**
-```python
-# Before: 3 separate matrix multiplies
-q = self.q_proj(x)  # [B, S, H] @ [H, num_heads * head_dim]
-k = self.k_proj(x)  # [B, S, H] @ [H, num_kv_heads * head_dim]
-v = self.v_proj(x)  # [B, S, H] @ [H, num_kv_heads * head_dim]
-
-# After: 1 fused matrix multiply + split
-fused_weight = torch.cat([q_proj.weight, k_proj.weight, v_proj.weight], dim=0)
-qkv = F.linear(x, fused_weight)
-q = qkv[..., :q_size]
-k = qkv[..., q_size:q_size+k_size]
-v = qkv[..., q_size+k_size:]
-```
-
-**Gate+Up Fusion (2 GEMMs -> 1) for MLP:**
-```python
-# Before: 2 separate matrix multiplies
-gate = self.gate_proj(x)
-up = self.up_proj(x)
-out = gelu(gate) * up
-
-# After: 1 fused matrix multiply + fused activation
-fused_weight = torch.cat([gate_proj.weight, up_proj.weight], dim=0)
-gate_up = F.linear(x, fused_weight)
-out = gelu_and_mul(gate_up)  # Triton fused kernel
-```
-
-**Implementation pattern:**
-```python
-def fuse_projections(model, verbose=True):
-    """Call AFTER loading weights, BEFORE torch.compile."""
-    for layer in model.layers:
-        attn = layer.self_attn
-        fused = torch.cat([attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight], dim=0)
-        attn.register_buffer("_fused_qkv_weight", fused)
-        attn._use_fused_qkv = True
-
-        mlp = layer.mlp
-        fused = torch.cat([mlp.gate_proj.weight, mlp.up_proj.weight], dim=0)
-        mlp.register_buffer("_fused_gate_up_weight", fused)
-        mlp._use_fused = True
-```
-
-### 2.5 Environment Variable Convention
-
-All optimizations should be toggleable via environment variables for A/B testing:
-
-```python
-# Standard pattern for optimization toggles
-USE_AITER_ATTENTION = os.environ.get("USE_AITER_ATTENTION", "0") == "1"
-USE_FUSED_PROJECTIONS = os.environ.get("USE_FUSED_PROJECTIONS", "0") == "1"
-USE_OPTIMIZED_OPS = os.environ.get("USE_OPTIMIZED_OPS", "0") == "1"
-USE_AITER_GEMM = os.environ.get("USE_AITER_GEMM", "0") == "1"
-TORCH_COMPILE_MODE = os.environ.get("TORCH_COMPILE_MODE", "reduce-overhead")
-```
-
-Default to OFF ("0") so the codebase remains compatible with non-AMD systems.
-
----
-
-## Phase 3: Benchmarking & Validation (Prove It Works)
-
-Goal: Quantify performance gains and verify numerical correctness.
-
-### 3.1 Precision Verification Script (Write First)
-
-**Always verify correctness before benchmarking performance.** Compare optimized outputs against eager baseline.
+**Always verify correctness before benchmarking performance.** Compare outputs against a known baseline.
 
 ```python
 #!/usr/bin/env python3
@@ -388,14 +171,6 @@ Goal: Quantify performance gains and verify numerical correctness.
 import torch
 
 def verify_precision(model, create_input_fn, optimize_fn, device="cuda"):
-    """
-    Compare model outputs with and without optimizations.
-
-    Args:
-        model: The model to test
-        create_input_fn: Callable that returns deterministic inputs
-        optimize_fn: Callable that enables optimizations on the model
-    """
     model.eval()
 
     # Run baseline (eager)
@@ -427,37 +202,30 @@ def verify_precision(model, create_input_fn, optimize_fn, device="cuda"):
     print(f"Max Absolute Diff: {max_diff:.6f}")
     print(f"Has NaN:           {has_nan}")
 
-    # Thresholds for BF16
     assert cos_sim > 0.99, f"Cosine similarity too low: {cos_sim}"
     assert max_diff < 1.0, f"Max diff too high: {max_diff}"
     assert not has_nan, "NaN detected in optimized output"
     print("PASSED")
 ```
 
-### 3.2 Inference Benchmark Script
+### 2.2 Inference Benchmark Script
 
-Measures end-to-end inference latency. The baseline is the naive (eager) PyTorch running on AMD, and the comparison target is the optimized version.
+Measures end-to-end inference latency. Record these numbers as the **baseline**.
 
 ```python
 #!/usr/bin/env python3
 """Template: inference latency benchmark."""
 
-import os
 import time
 import numpy as np
 import torch
 
 def benchmark_inference(model, create_input_fn, device="cuda",
                         warmup=10, iterations=30):
-    """
-    Benchmark inference latency with proper GPU synchronization.
-
-    Returns dict with: mean_ms, std_ms, p50_ms, p95_ms, throughput_hz, memory_gb
-    """
     model.eval()
     inputs = create_input_fn(device)
 
-    # Warmup (critical for torch.compile and GPU clock stabilization)
+    # Warmup (critical for GPU clock stabilization)
     with torch.no_grad():
         for _ in range(warmup):
             _ = model(**inputs)
@@ -486,12 +254,10 @@ def benchmark_inference(model, create_input_fn, device="cuda",
 **Key practices:**
 - Always `torch.cuda.synchronize()` before and after timing (GPU ops are async)
 - Use `time.perf_counter()` (not `time.time()`)
-- Warmup is mandatory: first iterations trigger compilation, kernel autotuning, GPU boost
+- Warmup is mandatory: first iterations trigger kernel autotuning and GPU boost
 - Report P50/P95, not just mean (captures variance)
 
-### 3.3 Training Throughput Benchmark Script
-
-Measures samples/second during training with full forward + backward + optimizer step.
+### 2.3 Training Throughput Benchmark Script
 
 ```python
 #!/usr/bin/env python3
@@ -502,17 +268,11 @@ import torch
 
 def benchmark_training(model, create_input_fn, device="cuda",
                        warmup=5, iterations=20):
-    """
-    Benchmark training throughput (samples/second).
-
-    Includes: forward pass, loss computation, backward pass, optimizer step.
-    """
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     inputs = create_input_fn(device, for_training=True)
     batch_size = inputs["input"].shape[0]
 
-    # Warmup
     for _ in range(warmup):
         optimizer.zero_grad()
         loss = model(**inputs)
@@ -520,7 +280,6 @@ def benchmark_training(model, create_input_fn, device="cuda",
         optimizer.step()
     torch.cuda.synchronize()
 
-    # Benchmark
     start = time.perf_counter()
     for _ in range(iterations):
         optimizer.zero_grad()
@@ -537,79 +296,9 @@ def benchmark_training(model, create_input_fn, device="cuda",
     }
 ```
 
-### 3.4 Multi-GPU DDP Benchmark Script
+### 2.4 Profiling with torch.profiler
 
-Measures scaling efficiency across multiple GPUs.
-
-```python
-#!/usr/bin/env python3
-"""Template: multi-GPU DDP training benchmark."""
-# Launch with: torchrun --nproc_per_node=NUM_GPUS script.py
-
-import os
-import time
-import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-
-def setup_distributed():
-    dist.init_process_group(backend="nccl")  # Works for both NVIDIA and AMD
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    return local_rank, dist.get_world_size()
-
-def benchmark_ddp(model_fn, create_input_fn, warmup=5, iterations=20):
-    rank, world_size = setup_distributed()
-    device = torch.device(f"cuda:{rank}")
-
-    model = model_fn().to(device).to(torch.bfloat16)
-    model = DDP(model, device_ids=[rank])
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-
-    inputs = create_input_fn(device, for_training=True)
-    batch_size = inputs["input"].shape[0]
-
-    # Warmup
-    model.train()
-    for _ in range(warmup):
-        optimizer.zero_grad()
-        loss = model(**inputs)
-        loss.backward()
-        optimizer.step()
-    torch.cuda.synchronize()
-    dist.barrier()
-
-    # Benchmark
-    start = time.perf_counter()
-    for _ in range(iterations):
-        optimizer.zero_grad()
-        loss = model(**inputs)
-        loss.backward()
-        optimizer.step()
-    torch.cuda.synchronize()
-    dist.barrier()
-    elapsed = time.perf_counter() - start
-
-    total_samples = batch_size * world_size * iterations
-    if rank == 0:
-        print(f"Throughput: {total_samples / elapsed:.1f} samples/s")
-        print(f"Step time:  {elapsed / iterations * 1000:.1f} ms")
-
-    dist.destroy_process_group()
-```
-
-**Test configurations to sweep:**
-
-| Batch/GPU | Total Batch | Seq Len | Purpose |
-|-----------|-------------|---------|---------|
-| 4 | 4 * N_GPU | 512 | Small batch baseline |
-| 8 | 8 * N_GPU | 512 | Medium batch |
-| 8 | 8 * N_GPU | 1024 | Long sequence |
-| 16 | 16 * N_GPU | 512 | Large batch (peak throughput) |
-
-### 3.5 Profiling with torch.profiler
-
-Generate Perfetto-compatible traces for kernel-level analysis:
+Generate traces for kernel-level analysis:
 
 ```python
 from torch.profiler import profile, ProfilerActivity
@@ -620,7 +309,6 @@ with profile(
     profile_memory=True,
     with_flops=True,
 ) as prof:
-    # Run a few iterations
     for _ in range(5):
         model(**inputs)
     torch.cuda.synchronize()
@@ -631,32 +319,299 @@ print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
 
 View traces at [Perfetto UI](https://ui.perfetto.dev/).
 
-### 3.6 Benchmark Reporting Template
+### 2.5 Record Baseline
 
-Structure benchmark results as a comparison table:
+After running benchmarks, document results:
 
 ```markdown
-## Results: Eager vs Optimized (AMD MI-300X)
+## Baseline (Eager PyTorch on AMD MI-XXX)
 
-### Inference (batch=1)
+| Metric | Value |
+|--------|-------|
+| Inference latency (P50) | XX ms |
+| Throughput | X.X Hz |
+| GPU memory | X.X GB |
+| Training samples/sec | X.X |
 
-| Configuration | Latency | Throughput | Memory |
-|---------------|---------|------------|--------|
-| Eager baseline | XX ms | X.X Hz | X.X GB |
-| + torch.compile | XX ms | X.X Hz | X.X GB |
-| + aiter attention | XX ms | X.X Hz | X.X GB |
-| + Triton kernels | XX ms | X.X Hz | X.X GB |
-| + fused projections | XX ms | X.X Hz | X.X GB |
-| **All optimizations** | **XX ms** | **X.X Hz** | X.X GB |
-
-### Training (8-GPU DDP)
-
-| Batch/GPU | Eager | Optimized | Speedup |
-|-----------|-------|-----------|---------|
-| 4 | X samples/s | X samples/s | X.Xx |
-| 8 | X samples/s | X samples/s | X.Xx |
-| 16 | X samples/s | X samples/s | X.Xx |
+Date: YYYY-MM-DD
+Hardware: AMD MI-XXX
+PyTorch: X.X.X+rocmX.X
 ```
+
+---
+
+## Phase 3: Optimize (Make It Fast)
+
+Goal: Apply optimizations incrementally, re-benchmarking after each change.
+
+### Optimization Priority Order
+
+Apply in this order (highest impact first). After each optimization, run the benchmark scripts from Phase 2 and record the improvement.
+
+1. **torch.compile** - biggest single win, minimal code changes
+2. **Attention kernel replacement** - replaces the most expensive operation
+3. **Triton kernel fusion** - eliminates kernel launch overhead for elementwise ops
+4. **Projection fusion** - reduces GEMM count in attention and MLP
+5. **GEMM kernel tuning** - hardware-specific matrix multiply routing
+
+### 3.1 torch.compile Configuration
+
+**CRITICAL: ROCm-specific torch.compile settings differ significantly from NVIDIA.**
+
+```python
+import os
+import torch
+
+vendor = "amd" if (hasattr(torch.version, "hip") and torch.version.hip) else "nvidia"
+
+if vendor == "amd":
+    # Use "default" mode on ROCm. DO NOT use "reduce-overhead".
+    compile_mode = os.environ.get("TORCH_COMPILE_MODE", "default")
+else:
+    compile_mode = os.environ.get("TORCH_COMPILE_MODE", "reduce-overhead")
+
+# Increase dynamo cache for models with dynamic shapes
+import torch._dynamo.config as dynamo_config
+dynamo_config.cache_size_limit = 64
+
+model.inference_fn = torch.compile(model.inference_fn, mode=compile_mode)
+```
+
+#### ROCm Inductor Configuration
+
+```python
+import torch._inductor.config as inductor_config
+
+def configure_inductor_for_amd():
+    """Configure inductor defaults for AMD ROCm GPUs."""
+    # CRITICAL: Disable CUDA/HIP graphs - broken or counterproductive on many ROCm versions
+    inductor_config.triton.cudagraphs = False
+
+    # Force ATEN backend for GEMMs (routes to rocBLAS, which is 35-55% faster than
+    # Triton-generated GEMM kernels on AMD)
+    inductor_config.max_autotune_gemm_backends = "ATEN"
+
+    # Standard fusion optimizations (these work well on ROCm)
+    inductor_config.epilogue_fusion = True
+    inductor_config.pattern_matcher = True
+    inductor_config.aggressive_fusion = True
+
+    # Disable memory planning if you hit ROCm-specific bugs
+    # inductor_config.memory_planning = False
+```
+
+> **Rule: `reduce-overhead` mode can be orders of magnitude SLOWER on ROCm.** It enables CUDA/HIP graphs which are unstable on ROCm. Always default to `"default"` mode on AMD and benchmark before trying other modes.
+
+> **Rule: Triton GEMM kernels are significantly slower than rocBLAS on AMD.** Force the ATEN backend for GEMMs. Triton is still excellent for elementwise/fusion kernels (RMSNorm, activations).
+
+### 3.2 Attention Kernel Optimization
+
+Replace PyTorch's generic attention with AMD-optimized flash attention (e.g., from the `aiter` library):
+
+```python
+AITER_AVAILABLE = False
+try:
+    import aiter
+    AITER_AVAILABLE = True
+except ImportError:
+    pass
+
+USE_AITER_ATTENTION = os.environ.get("USE_AITER_ATTENTION", "0") == "1"
+
+def aiter_attention_forward(module, query, key, value, attention_mask, scaling, **kwargs):
+    """Flash attention using AMD-optimized kernels."""
+    q_len, k_len = query.shape[2], key.shape[2]
+
+    # Classify mask type (flash attention only supports causal/full)
+    use_causal, can_use_flash = _classify_mask(attention_mask, q_len, k_len)
+    if not can_use_flash:
+        return eager_attention_forward(module, query, key, value, attention_mask, scaling, **kwargs)
+
+    # Transpose to [batch, seq, heads, head_dim] for flash attention
+    q = query.transpose(1, 2)
+    k = key.transpose(1, 2)
+    v = value.transpose(1, 2)
+
+    result = aiter.flash_attn_func(q, k, v,
+        dropout_p=0.0, softmax_scale=scaling, causal=use_causal)
+    attn_output = result[0] if isinstance(result, tuple) else result
+    return attn_output, None
+```
+
+> **Hint: Native GQA/MQA support.** If the flash attention kernel supports different Q/KV head counts natively, skip `repeat_kv` to avoid unnecessary memory copies. Check the kernel's documentation.
+
+> **Hint: Avoid unnecessary `.contiguous()`.** After `transpose(1, 2)`, the last dimension usually remains contiguous (`stride(-1)==1`). Only call `.contiguous()` when the kernel explicitly rejects the tensor layout.
+
+> **Hint: Direct op calls for torch.compile.** If using torch.compile, prefer calling the underlying registered op (e.g., `torch.ops.vendor.op_name`) instead of high-level Python wrappers. This avoids Python-side logic that creates graph breaks during tracing.
+
+> **Hint: Multi-level fallback chain.** Implement graceful degradation: vendor flash attention -> SDPA -> eager. Each level catches errors and falls back to the next.
+
+### 3.3 Triton Kernel Fusion
+
+Write fused Triton kernels for elementwise operations. See [references/triton_kernel_patterns.md](references/triton_kernel_patterns.md) for complete implementations.
+
+**High-value targets (ordered by impact):**
+
+1. **RMSNorm** - replaces 5 ops with 1 kernel (~3.4x speedup)
+2. **Fused GELU + Mul** - replaces 3 ops with 1 kernel (~1.6x speedup)
+3. **Fused Add + RMSNorm** - combines residual addition with normalization (~2.8x speedup)
+4. **Fused SiLU + Mul** - alternative activation fusion (~1.4x speedup)
+
+**General Triton kernel pattern:**
+```python
+@triton.jit
+def _fused_kernel(X_ptr, Y_ptr, stride, N, BLOCK_SIZE: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    x = tl.load(X_ptr + row * stride + cols, mask=mask).to(tl.float32)
+    # ... fused computation in float32 ...
+    tl.store(Y_ptr + row * stride + cols, result.to(tl.bfloat16), mask=mask)
+```
+
+**Design rules:**
+- Compute in float32, store in bfloat16 (numerical stability)
+- BLOCK_SIZE must be a power of 2 and >= N
+- Always provide an eager fallback when Triton is unavailable
+- Use environment variables to toggle optimized vs eager paths
+
+> **Rule: Clamp values before `exp()` in Triton on ROCm.** Some ROCm Triton builds lack a native tanh intrinsic, so tanh is implemented via `exp`. Large inputs cause overflow -> inf/inf -> NaN. Always clamp: `inner = tl.maximum(tl.minimum(inner, 10.0), -10.0)` before `exp`.
+
+### 3.4 Projection Fusion
+
+Reduce kernel launch count by fusing separate linear projections into combined GEMMs:
+
+**QKV Fusion (3 GEMMs -> 1):**
+```python
+fused_weight = torch.cat([q_proj.weight, k_proj.weight, v_proj.weight], dim=0)
+qkv = F.linear(x, fused_weight)
+q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
+```
+
+**Gate+Up Fusion (2 GEMMs -> 1) for MLP:**
+```python
+fused_weight = torch.cat([gate_proj.weight, up_proj.weight], dim=0)
+gate_up = F.linear(x, fused_weight)
+out = gelu_and_mul(gate_up)  # Triton fused kernel
+```
+
+**Implementation pattern:**
+```python
+def fuse_projections(model, verbose=True):
+    """Call AFTER loading weights, BEFORE torch.compile."""
+    for layer in model.layers:
+        attn = layer.self_attn
+        fused = torch.cat([attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight], dim=0)
+        attn.register_buffer("_fused_qkv_weight", fused)
+        attn._use_fused_qkv = True
+```
+
+### 3.5 GEMM Kernel Routing
+
+For vendor-specific GEMM libraries (e.g., aiter on AMD), route based on matrix shape:
+
+```python
+def vendor_linear(x, weight, bias=None):
+    """Route GEMM to vendor-optimized kernel for small M, rocBLAS for large M."""
+    M = x.numel() // x.shape[-1]
+    M_THRESHOLD = int(os.environ.get("GEMM_M_THRESHOLD", "64"))
+
+    if M <= M_THRESHOLD and VENDOR_GEMM_AVAILABLE:
+        return vendor_gemm_fn(x, weight, bias)
+    else:
+        return F.linear(x, weight, bias)
+```
+
+> **Hint: Weight preshuffling.** Some vendor GEMM kernels expect weights in a specific layout. Pre-shuffle weights at model load time (after loading, before inference) to avoid per-call overhead. Keep the original weight intact for fallback paths.
+
+> **Hint: M-threshold routing.** Vendor-tuned GEMM kernels often beat rocBLAS only for small M dimensions (e.g., batch=1 inference). For large M (training batches), rocBLAS/ATEN is usually faster. Profile to find the crossover point.
+
+### 3.6 torch.compile Compatibility
+
+When preparing code for torch.compile, watch out for these patterns:
+
+> **Rule: Replace `while` loops with `for` loops.** `while condition:` loops cause torch.compile to recursively unroll or fail. Convert to `for step in range(num_steps):` with a precomputed iteration count.
+
+> **Rule: Pre-allocate constant tensors as module buffers.** Tensors created inside `forward()` (e.g., attention masks, timestep schedules) trigger host-to-device transfers that break CUDA graph capture. Register them as buffers with `register_buffer()`.
+
+> **Rule: Cache repeated tensor allocations.** If you create the same tensor every forward pass (e.g., a schedule, a padding mask), compute it once and cache it on the module.
+
+### 3.7 Environment Variable Convention
+
+All optimizations should be toggleable for A/B testing:
+
+```python
+USE_AITER_ATTENTION = os.environ.get("USE_AITER_ATTENTION", "0") == "1"
+USE_FUSED_PROJECTIONS = os.environ.get("USE_FUSED_PROJECTIONS", "0") == "1"
+USE_OPTIMIZED_OPS = os.environ.get("USE_OPTIMIZED_OPS", "0") == "1"
+TORCH_COMPILE_MODE = os.environ.get("TORCH_COMPILE_MODE", "default")
+```
+
+Default to OFF ("0") so the codebase remains compatible with non-AMD systems.
+
+---
+
+## Phase 4: Re-benchmark & Iterate (Prove It)
+
+Goal: Quantify each optimization's impact and iterate.
+
+### 4.1 Incremental Benchmark Reporting
+
+After each optimization from Phase 3, re-run the exact same benchmark scripts from Phase 2. Report results incrementally:
+
+```markdown
+## Results: Optimization Progression (AMD MI-XXX)
+
+| Configuration | Latency (P50) | vs Baseline | Memory |
+|---------------|---------------|-------------|--------|
+| Eager baseline | XX ms | 1.00x | X.X GB |
+| + torch.compile (default) | XX ms | X.Xx | X.X GB |
+| + aiter attention | XX ms | X.Xx | X.X GB |
+| + Triton kernels | XX ms | X.Xx | X.X GB |
+| + fused projections | XX ms | X.Xx | X.X GB |
+| + GEMM routing | XX ms | X.Xx | X.X GB |
+| **All optimizations** | **XX ms** | **X.Xx** | X.X GB |
+```
+
+### 4.2 If an Optimization Regresses
+
+- **Latency increased**: The optimization may not be suitable for this hardware/workload. Disable it and move on.
+- **NaN appeared**: Check numerical stability (especially Triton kernels). See the clamping rule in 3.3.
+- **torch.compile fails**: Check for graph breaks. Use `TORCH_LOGS="graph_breaks" python script.py` to diagnose.
+
+### 4.3 Multi-GPU DDP Benchmark
+
+After single-GPU optimizations are validated, test multi-GPU scaling:
+
+```python
+# Launch with: torchrun --nproc_per_node=NUM_GPUS script.py
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+def setup_distributed():
+    dist.init_process_group(backend="nccl")  # Works for both NVIDIA and AMD
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    return local_rank, dist.get_world_size()
+```
+
+---
+
+## ROCm-Specific Gotchas (Quick Reference)
+
+These are hard-won lessons from real AMD GPU optimization work:
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| `reduce-overhead` mode extremely slow | CUDA/HIP graphs broken on many ROCm versions | Use `"default"` mode |
+| Triton GEMM 35-55% slower than expected | Triton codegen suboptimal for AMD GEMM | Force `ATEN` backend in inductor |
+| NaN in Triton GELU/tanh kernel | `exp()` overflow (no native tanh intrinsic) | Clamp input to `[-10, 10]` before `exp` |
+| torch.compile infinite recursion | `while` loop in forward pass | Convert to `for` loop |
+| CUDA graph capture fails | Host-to-device transfer during capture | Pre-allocate tensors as module buffers |
+| Dynamo RNG state error during graph capture | ROCm bug: `get_state` unsupported in capture | Patch Dynamo to skip RNG state on ROCm |
+| `repeat_kv` slow or breaks compile | Creates expanded/zero-stride views | Use native GQA support in attention kernel |
+| `.contiguous()` adds overhead | Unnecessary copy after transpose | Only call when kernel rejects the layout |
+| Sync overhead (30%+ of wall time) | Excessive `hipDeviceSynchronize` calls | Profile sync time, use async patterns |
 
 ---
 
@@ -664,17 +619,19 @@ Structure benchmark results as a comparison table:
 
 1. **Don't replace `torch.cuda` with `torch.hip`** - The `torch.cuda` API is the correct abstraction on both platforms.
 
-2. **Don't skip warmup in benchmarks** - First iterations include JIT compilation, autotuning, and GPU clock ramp-up. Always warm up 5-20 iterations.
+2. **Don't skip warmup in benchmarks** - First iterations include JIT compilation, autotuning, and GPU clock ramp-up.
 
 3. **Don't forget `torch.cuda.synchronize()`** - GPU ops are asynchronous. Without sync, you measure CPU dispatch time, not GPU execution time.
 
-4. **Don't use Triton custom ops inside DDP** - Custom Triton kernels with non-standard parameters may break DDP gradient synchronization. Use `nn.RMSNorm` etc. in DDP, save Triton ops for single-GPU or inference.
+4. **Don't assume NVIDIA compile modes work on AMD** - `reduce-overhead` and `max-autotune` behave very differently on ROCm. Always benchmark.
 
 5. **Don't assume all attention masks work with flash attention** - Flash attention only supports pure causal and full bidirectional masks. Always implement fallback to eager for complex masks.
 
-6. **Don't hardcode compilation paths** - Always make optimizations toggleable via environment variables so the same codebase runs on both NVIDIA and AMD.
+6. **Don't hardcode compilation paths** - Always make optimizations toggleable via environment variables.
 
-7. **Always verify precision first** - Run the precision verification script before reporting any performance numbers. Optimized code that produces wrong results is useless.
+7. **Always verify precision first** - Run the precision verification script before reporting any performance numbers.
+
+8. **Always benchmark before AND after** - Never claim an optimization helps without measuring the delta against the established baseline.
 
 ---
 
@@ -693,5 +650,5 @@ project/
     verify_precision.py       # Correctness validation
   shared/
     gpu_utils.py              # Cross-vendor GPU abstraction
-  benchmark.md                # Results documentation
+  benchmark.md                # Results documentation (baseline + progression)
 ```

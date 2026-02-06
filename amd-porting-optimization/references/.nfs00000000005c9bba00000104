@@ -89,9 +89,6 @@ def _gelu_tanh_and_mul_kernel(
     # GELU tanh approximation
     k = 0.7978845608028654  # sqrt(2/pi)
     inner = k * (gate + 0.044715 * gate * gate * gate)
-    # IMPORTANT: Clamp before exp to avoid overflow -> inf/inf -> NaN on ROCm
-    # (some ROCm Triton builds lack a native tanh intrinsic)
-    inner = tl.maximum(tl.minimum(inner, 10.0), -10.0)
     exp_2x = tl.math.exp(2.0 * inner)
     tanh_val = (exp_2x - 1.0) / (exp_2x + 1.0)
     gelu_gate = 0.5 * gate * (1.0 + tanh_val)
