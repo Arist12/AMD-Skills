@@ -7,6 +7,7 @@ Agent skills collection for AMD hardware development workflows.
 - **amd-porting-optimization**: Port NVIDIA-only PyTorch repos to AMD ROCm, optimize with AMD-specific kernels, and benchmark
 - **rocprofv3-profiler**: Profile AMD GPU kernels and analyze performance bottlenecks
 - **clean-code-style**: Behavioral guidelines to reduce common LLM coding mistakes — think before coding, simplicity first, surgical changes, goal-driven execution
+- **skill-creator**: Guide for creating effective skills. Imported from https://github.com/anthropics/skills
 
 ## Usage as Git Submodule
 
