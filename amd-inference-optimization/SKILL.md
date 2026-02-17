@@ -2,19 +2,19 @@
 name: amd-inference-optimization
 description: >
   Systematic kernel-level inference latency optimization for PyTorch models on AMD GPUs
-  (MI300X, MI350X, ROCm). Use when asked to optimize, profile, or reduce inference latency
+  (MI300X, MI355X, ROCm series, etc..). Use when asked to optimize, profile, or reduce inference latency
   on AMD/ROCm hardware. Covers: GEMM backend selection (rocBLAS vs Triton), CUDAGraph/HIP
   graph capture, attention optimization (aiter flash attention, SDPA fast-path), Triton kernel
   authoring for AMD wavefronts, Inductor configuration for ROCm, kernel fusion strategies,
-  synchronization overhead reduction, and profiling workflows. Focuses on single-batch (B=1)
-  latency, not training or throughput. Triggered by: "optimize inference on AMD/MI300/MI350",
+  synchronization overhead reduction, and profiling workflows. Focuses on single-batch (bsz=1)
+  latency, not training or throughput. Triggered by: "optimize inference on AMD/MI300/MI355",
   "reduce latency on ROCm", "profile PyTorch on AMD GPU", "torch.compile on ROCm",
   "CUDAGraph on AMD", "Triton kernels for AMD".
 ---
 
 # AMD GPU Inference Latency Optimization
 
-Systematic workflow for reducing PyTorch inference latency on AMD GPUs (MI300X/MI350X/ROCm). Ordered by impact. Each phase builds on the previous.
+Systematic workflow for reducing PyTorch inference latency on AMD GPUs (MI300X/MI355X/ROCm). Ordered by impact. Each phase builds on the previous.
 
 ## Optimization Ladder (Reference Impact)
 
