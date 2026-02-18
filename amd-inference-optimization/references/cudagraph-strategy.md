@@ -105,18 +105,16 @@ Patch `preserve_global_state` to skip CUDA RNG state during graph capture:
 import contextlib
 import random as _py_random
 import torch
-import torch._dynamo.utils as dynamo_utils
+import torch._dynamo.convert_frame as _convert_frame  # NOT torch._dynamo.utils
 
 def patch_dynamo_preserve_global_state_for_rocm_cudagraph_capture():
     """Patch Dynamo to skip CUDA RNG state during graph capture on ROCm."""
 
     @contextlib.contextmanager
     def patched_preserve_global_state(tx):
-        # Save Python and CPU RNG state (always safe)
         py_rng_state = _py_random.getstate()
         torch_rng_state = torch.random.get_rng_state()
 
-        # Save CUDA RNG state ONLY when not capturing
         cuda_rng_state = None
         if torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
             cuda_rng_state = torch.cuda.get_rng_state()
@@ -124,19 +122,17 @@ def patch_dynamo_preserve_global_state_for_rocm_cudagraph_capture():
         try:
             yield
         finally:
-            # Restore Python and CPU RNG state
             _py_random.setstate(py_rng_state)
             torch.random.set_rng_state(torch_rng_state)
 
-            # Restore CUDA RNG state only if we saved it
             if cuda_rng_state is not None and not torch.cuda.is_current_stream_capturing():
                 torch.cuda.set_rng_state(cuda_rng_state)
 
-    # Apply the patch
-    dynamo_utils.preserve_global_state = patched_preserve_global_state
+    # Apply the patch — correct module is convert_frame, NOT utils
+    _convert_frame.preserve_global_state = patched_preserve_global_state
 
 
-# Call BEFORE any torch.compile() calls:
+# Call BEFORE any torch.compile() or CUDAGraph capture:
 patch_dynamo_preserve_global_state_for_rocm_cudagraph_capture()
 ```
 

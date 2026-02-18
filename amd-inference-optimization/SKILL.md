@@ -51,59 +51,65 @@ Collect: total latency, kernel count, GEMM time fraction, sync overhead, launch 
 
 ## Phase 1: CUDAGraph / HIP Graph Capture
 
-Largest single optimization. Eliminates CPU-side kernel launch overhead by capturing the entire GPU execution graph and replaying it.
+Largest single optimization. Eliminates CPU-side kernel launch overhead by capturing the entire GPU execution graph and replaying it. Typically -30-50% latency; on multi-step models (e.g., flow-matching denoise loops), can reach -60%.
 
-**Critical**: On ROCm, Inductor-level cudagraphs are broken (can cause 65x slowdown). Use manual full-call capture instead.
+**CRITICAL DECISION — Do NOT combine torch.compile with CUDAGraph on ROCm:**
 
+| Approach | ROCm Status | Why |
+|----------|-------------|-----|
+| `torch.compile(mode="reduce-overhead")` | **BROKEN** | Stalls 20+ min on Triton autotune, 65x slowdown |
+| `torch.compile(mode="default")` + manual graph | **CONFLICTS** | Double-graph semantics, tensor ownership errors |
+| **Eager model + manual `torch.cuda.CUDAGraph()`** | **PROVEN** | Instantaneous capture, same or better latency |
+
+The proven path: **do NOT use torch.compile at all for the CUDAGraph path**. Use the eager (uncompiled) model with manual `torch.cuda.CUDAGraph()` capture. This was validated on a 3.5B transformer where manual capture achieved the same latency as torch.compile but without the 20+ minute compilation stall.
+
+**Incremental capture strategy** (do NOT try to capture everything at once):
+
+- **Step A**: Capture ONLY the hot loop (e.g., denoise loop). Pre-compute prefix/constants outside the graph. Test correctness.
+- **Step B**: Only after Step A works and passes correctness, expand to capture the full pipeline (prefix + loop).
+- **Step C**: Step B requires DynamicCache bypass — see [references/dynamiccache-bypass.md](references/dynamiccache-bypass.md).
+
+**Manual CUDAGraph capture pattern (eager model, no torch.compile):**
 ```python
-# Inductor cudagraphs MUST be disabled on ROCm
-import torch._inductor.config as inductor_config
-inductor_config.triton.cudagraphs = False
+# NO torch.compile — capture on the eager model directly
+model.eval()
 
-# Use torch.compile with mode="default", NOT "reduce-overhead"
-model = torch.compile(model, mode="default")
-```
+# 1. Pre-allocate static input buffers (fixed shapes, fixed memory addresses)
+static_inputs = [inp.clone() for inp in example_inputs]
 
-**Manual CUDAGraph capture pattern:**
-```python
-# 1. Warm up (run model once to trigger compilation)
+# 2. Warm up (run model a few times to stabilize memory layout)
 with torch.no_grad():
-    _ = model(*static_inputs)
+    for _ in range(3):
+        _ = model(*static_inputs)
 torch.cuda.synchronize()
 
-# 2. Capture
+# 3. Capture
 graph = torch.cuda.CUDAGraph()
-pool = torch.cuda.graph_pool_handle()  # Private memory pool
-with torch.cuda.graph(graph, pool=pool):
+with torch.cuda.graph(graph):
     static_output = model(*static_inputs)
+torch.cuda.synchronize()
 
-# 3. Replay (in inference loop)
-# Copy new data into static_inputs tensors (same memory addresses)
-static_inputs[0].copy_(new_input)
+# 4. Replay (in inference loop)
+for inp in static_inputs:
+    inp.copy_(new_data)  # Copy into static buffers (same memory addresses)
 graph.replay()
 result = static_output.clone()
 ```
 
-**ROCm Dynamo patch** (required for graph capture with torch.compile):
+**ROCm Dynamo RNG patch** (required if any torch.compile is used elsewhere):
 
-ROCm disallows CUDA RNG state queries during graph capture. Patch Dynamo's `preserve_global_state` to skip RNG state during capture:
+The module path is `torch._dynamo.convert_frame`, **NOT** `torch._dynamo.utils`. Apply before any graph capture:
 
 ```python
-import torch._dynamo.utils as dynamo_utils
+import torch._dynamo.convert_frame as _convert_frame
 
-_orig_preserve = dynamo_utils.preserve_global_state
-
-@contextlib.contextmanager
-def _patched_preserve(tx):
-    # Skip CUDA RNG state only while capturing
-    with _orig_preserve(tx) as result:
-        yield result
-
-# Or more precisely: guard torch.cuda.get_rng_state() calls with
-# `if not torch.cuda.is_current_stream_capturing():`
+# Guard torch.cuda.get_rng_state() calls with:
+# if not torch.cuda.is_current_stream_capturing():
 ```
 
-See [references/cudagraph-strategy.md](references/cudagraph-strategy.md) for the complete patch.
+See [references/cudagraph-integration.md](references/cudagraph-integration.md) for the complete inline integration pattern.
+See [references/cudagraph-strategy.md](references/cudagraph-strategy.md) for the Dynamo RNG patch and memory pool details.
+See [references/dynamiccache-bypass.md](references/dynamiccache-bypass.md) for HuggingFace DynamicCache replacement.
 
 ## Phase 2: Attention Optimization
 
@@ -244,7 +250,8 @@ After each optimization phase, re-measure:
 
 | Do NOT | Why | Do Instead |
 |--------|-----|-----------|
-| `torch.compile(mode="reduce-overhead")` | Broken on ROCm (65x slowdown) | `mode="default"` + manual CUDAGraph |
+| `torch.compile` + CUDAGraph together | Double-graph conflicts, 20+ min Triton autotune stall | Eager model + manual `torch.cuda.CUDAGraph()` |
+| `torch.compile(mode="reduce-overhead")` | Broken on ROCm (65x slowdown) | Eager + manual CUDAGraph, or `mode="default"` without graph |
 | `inductor_config.triton.cudagraphs = True` | Inductor graph capture broken on ROCm | Manual CUDAGraph capture |
 | `inductor_config.memory_planning = True` | Deep recursion on ROCm | Keep `False` |
 | `torch.cuda.synchronize()` (device-wide) | hipDeviceSynchronize is 3.7x more expensive than CUDA | `torch.cuda.current_stream().synchronize()` |
@@ -263,8 +270,12 @@ export HSA_ENABLE_SDMA=1         # Enable SDMA engine
 
 ## References
 
+- [CUDAGraph Integration](references/cudagraph-integration.md) - Inline capture pattern for flow-matching models, correctness verification
+- [CUDAGraph Strategy](references/cudagraph-strategy.md) - Manual capture, Dynamo RNG patch, memory pool
+- [DynamicCache Bypass](references/dynamiccache-bypass.md) - Replace HuggingFace DynamicCache with static KV buffers for graph capture
+- [BSNH Layout Unification](references/bsnh-layout.md) - Eliminate tensor transposes by keeping BSNH format end-to-end
+- [AITER Integration](references/aiter-integration.md) - Flash attention, tensor layout, GQA support
 - [GEMM Optimization](references/gemm-optimization.md) - rocBLAS, aiter tuned GEMM, weight preshuffling, per-shape tuning
 - [Inductor Configuration](references/inductor-config.md) - Complete torch._inductor.config for ROCm
-- [CUDAGraph Strategy](references/cudagraph-strategy.md) - Manual capture, Dynamo RNG patch, memory pool
 - [Triton Kernels for AMD](references/triton-kernels.md) - RMSNorm, fused activations, AMD wavefront tuning
 - [Profiling Workflow](references/profiling-workflow.md) - rocprof, torch.profiler, Chrome tracing
