@@ -9,6 +9,19 @@ into an actual model so the production code path uses graph replay.
 CUDAGraph must be integrated INTO the model's inference method, not wrapped around it. The
 model's `sample_actions()` or `forward()` method itself must contain the capture/replay logic.
 
+## CRITICAL: torch.compile + CUDAGraph Are Complementary
+
+On ROCm, the **recommended** approach is:
+1. `torch.compile(mode="default")` — provides kernel fusion (fusing pointwise ops, epilogues, etc.)
+2. Manual `torch.cuda.CUDAGraph()` — eliminates CPU-side kernel launch overhead
+
+These are **complementary optimizations**, not alternatives. Disabling torch.compile to use
+CUDAGraph loses all kernel fusion benefits and typically regresses latency by 20-40%.
+
+**Do NOT** confuse this with `mode="reduce-overhead"` (which uses Inductor's internal graph
+capture and is broken on ROCm). The combination of `mode="default"` + manual graph capture
+works because Inductor's internal capture is disabled while we capture the compiled output manually.
+
 ## Integration Pattern for Flow-Matching Models (e.g., OpenPI pi0)
 
 Flow-matching models have a two-phase inference:
@@ -17,6 +30,10 @@ Flow-matching models have a two-phase inference:
 
 CUDAGraph should capture the ENTIRE `sample_actions` call (prefix + all denoise steps) as one
 graph, since the benchmark measures the full call.
+
+**Important**: The model should be compiled with `torch.compile(mode="default")` BEFORE graph
+capture. This ensures kernel fusion is applied to both the prefix and denoise steps. Configure
+Inductor to disable its internal graph capture (`triton.cudagraphs = False`) before compiling.
 
 ### Step 1: Convert while-loop to for-loop (prerequisite)
 

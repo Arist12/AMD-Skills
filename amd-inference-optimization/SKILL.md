@@ -53,15 +53,27 @@ Collect: total latency, kernel count, GEMM time fraction, sync overhead, launch 
 
 Largest single optimization. Eliminates CPU-side kernel launch overhead by capturing the entire GPU execution graph and replaying it. Typically -30-50% latency; on multi-step models (e.g., flow-matching denoise loops), can reach -60%.
 
-**CRITICAL DECISION — Do NOT combine torch.compile with CUDAGraph on ROCm:**
+**CRITICAL DECISION — torch.compile + CUDAGraph strategy on ROCm:**
 
-| Approach | ROCm Status | Why |
-|----------|-------------|-----|
-| `torch.compile(mode="reduce-overhead")` | **BROKEN** | Stalls 20+ min on Triton autotune, 65x slowdown |
-| `torch.compile(mode="default")` + manual graph | **CONFLICTS** | Double-graph semantics, tensor ownership errors |
-| **Eager model + manual `torch.cuda.CUDAGraph()`** | **PROVEN** | Instantaneous capture, same or better latency |
+| Approach | ROCm Status | Notes |
+|----------|-------------|-------|
+| `torch.compile(mode="reduce-overhead")` | **BROKEN** | Inductor's internal graph capture stalls 20+ min, 65x slowdown |
+| `inductor_config.triton.cudagraphs = True` | **BROKEN** | Same internal capture mechanism, same failure |
+| `torch.compile(mode="default")` + manual `torch.cuda.CUDAGraph()` | **RECOMMENDED** | Compile for kernel fusion, then manually capture the compiled graph |
+| Eager model + manual `torch.cuda.CUDAGraph()` | **FALLBACK** | Use only if compiled + manual graph fails for a specific model |
 
-The proven path: **do NOT use torch.compile at all for the CUDAGraph path**. Use the eager (uncompiled) model with manual `torch.cuda.CUDAGraph()` capture. This was validated on a 3.5B transformer where manual capture achieved the same latency as torch.compile but without the 20+ minute compilation stall.
+**The recommended path: `torch.compile(mode="default")` FIRST, then manual CUDAGraph capture.**
+
+torch.compile provides kernel fusion (fusing pointwise ops, epilogue fusion, etc.) which typically saves 20-40% latency. CUDAGraph eliminates CPU-side kernel launch overhead (~2-5ms). These are **complementary, not competing** optimizations. Disabling torch.compile to use CUDAGraph alone loses all kernel fusion benefits and will regress latency.
+
+**Requirements for the combined approach:**
+1. Apply Dynamo RNG patch BEFORE any compile or graph capture (see below)
+2. Set `inductor_config.triton.cudagraphs = False` (disable Inductor's broken internal capture)
+3. Set `inductor_config.memory_planning = False` (crashes on ROCm)
+4. Warm up the compiled model (3-5 forward passes) to resolve JIT compilation before graph capture
+5. Use `torch.cuda.graph_pool_handle()` for memory pool management
+
+**Fall back to eager + manual CUDAGraph only if** the compiled model raises errors during graph capture (e.g., tensor ownership errors, dynamic shapes inside compiled regions). Document the specific error when falling back.
 
 **Incremental capture strategy** (do NOT try to capture everything at once):
 
@@ -69,31 +81,59 @@ The proven path: **do NOT use torch.compile at all for the CUDAGraph path**. Use
 - **Step B**: Only after Step A works and passes correctness, expand to capture the full pipeline (prefix + loop).
 - **Step C**: Step B requires DynamicCache bypass — see [references/dynamiccache-bypass.md](references/dynamiccache-bypass.md).
 
-**Manual CUDAGraph capture pattern (eager model, no torch.compile):**
+**Manual CUDAGraph capture pattern (with torch.compile — RECOMMENDED):**
 ```python
-# NO torch.compile — capture on the eager model directly
-model.eval()
+import torch._inductor.config as inductor_config
 
-# 1. Pre-allocate static input buffers (fixed shapes, fixed memory addresses)
+# CRITICAL: configure Inductor BEFORE torch.compile
+inductor_config.triton.cudagraphs = False       # disable broken internal capture
+inductor_config.triton.cudagraph_trees = False   # disable broken internal capture
+inductor_config.memory_planning = False          # crashes on ROCm
+inductor_config.max_autotune_gemm_backends = "ATEN"  # rocBLAS >> Triton for GEMMs
+inductor_config.epilogue_fusion = True
+inductor_config.aggressive_fusion = True
+
+# Step 1: Compile the model (kernel fusion, NOT graph capture)
+model.eval()
+model = torch.compile(model, mode="default")  # NOT "reduce-overhead"
+
+# Step 2: Pre-allocate static input buffers
 static_inputs = [inp.clone() for inp in example_inputs]
 
-# 2. Warm up (run model a few times to stabilize memory layout)
+# Step 3: Warm up (triggers JIT compilation + Triton autotuning)
+with torch.no_grad():
+    for _ in range(5):
+        _ = model(*static_inputs)
+torch.cuda.current_stream().synchronize()  # stream-level sync (faster on ROCm)
+
+# Step 4: Capture the COMPILED model as a CUDAGraph
+pool = torch.cuda.graph_pool_handle()
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph, pool=pool):
+    static_output = model(*static_inputs)
+torch.cuda.current_stream().synchronize()
+
+# Step 5: Replay (in inference loop)
+for inp in static_inputs:
+    inp.copy_(new_data)
+graph.replay()
+result = static_output.clone()
+```
+
+**Fallback: eager model + manual CUDAGraph (if compiled capture fails):**
+```python
+# Use ONLY if torch.compile + manual graph raises errors for your model
+model.eval()
+# NO torch.compile
+static_inputs = [inp.clone() for inp in example_inputs]
 with torch.no_grad():
     for _ in range(3):
         _ = model(*static_inputs)
 torch.cuda.synchronize()
-
-# 3. Capture
 graph = torch.cuda.CUDAGraph()
 with torch.cuda.graph(graph):
     static_output = model(*static_inputs)
 torch.cuda.synchronize()
-
-# 4. Replay (in inference loop)
-for inp in static_inputs:
-    inp.copy_(new_data)  # Copy into static buffers (same memory addresses)
-graph.replay()
-result = static_output.clone()
 ```
 
 **ROCm Dynamo RNG patch** (required if any torch.compile is used elsewhere):
@@ -246,18 +286,47 @@ After each optimization phase, re-measure:
 2. Kernel count (fewer = better; target: reduce by 15-20%)
 3. Numerical correctness (compare outputs to baseline within tolerance)
 
+## Mandatory Escalation Rules
+
+**These rules are NON-NEGOTIABLE. The agent MUST follow them.**
+
+1. **After completing any phase**, run the verification gate (benchmark with CUDA events). If the latency target is NOT met, you MUST proceed to the next phase. Do NOT choose STOP.
+
+2. **Phase progression is mandatory until target is met or all phases exhausted:**
+   - Phase 0 (profile) -> Phase 1 (CUDAGraph) -> Phase 2 (attention) -> Phase 3 (GEMM) -> Phase 4 (fusion) -> Phase 5 (Triton kernels) -> Phase 6 (fine-tuning) -> Phase 7 (verify)
+   - At each step: measure, compare to target, proceed if not met.
+
+3. **Do NOT conclude that the target is "unachievable" after only 1-2 phases.** The optimization ladder is cumulative — individual phases may yield small improvements, but the combined effect across all phases is significant (typically 2-3x total).
+
+4. **When a phase fails or shows no improvement**, document why, then CONTINUE to the next phase. Different phases target different bottlenecks (launch overhead, compute, memory bandwidth).
+
+5. **Only choose STOP when one of these conditions is true:**
+   - The latency target IS met (verified by benchmark)
+   - ALL phases (0-7) have been attempted and measured
+   - A blocking error prevents any further progress (document the error)
+
+6. **Log a progress table** after each phase:
+   ```
+   | Phase | p50 (ms) | vs Baseline | vs Target | Status |
+   |-------|----------|-------------|-----------|--------|
+   | Baseline | XX.X | - | +YY.X ms | NOT MET |
+   | Phase 1 | XX.X | -Z.Z% | +YY.X ms | NOT MET -> proceed to Phase 2 |
+   ```
+
 ## Anti-Patterns on ROCm
 
 | Do NOT | Why | Do Instead |
 |--------|-----|-----------|
-| `torch.compile` + CUDAGraph together | Double-graph conflicts, 20+ min Triton autotune stall | Eager model + manual `torch.cuda.CUDAGraph()` |
-| `torch.compile(mode="reduce-overhead")` | Broken on ROCm (65x slowdown) | Eager + manual CUDAGraph, or `mode="default"` without graph |
-| `inductor_config.triton.cudagraphs = True` | Inductor graph capture broken on ROCm | Manual CUDAGraph capture |
+| `torch.compile(mode="reduce-overhead")` | Inductor's internal CUDAGraph capture broken on ROCm (65x slowdown) | `torch.compile(mode="default")` + manual `torch.cuda.CUDAGraph()` |
+| `inductor_config.triton.cudagraphs = True` | Inductor internal graph capture broken on ROCm | `= False`, then manual CUDAGraph capture |
+| Disable torch.compile to use CUDAGraph | Loses kernel fusion benefits, 20-40% latency regression | Keep `torch.compile(mode="default")` AND add manual CUDAGraph on top |
+| Eager-only + CUDAGraph (without trying compiled first) | CUDAGraph only saves launch overhead (~2-5ms), not compute | Always try compiled + CUDAGraph first, eager is fallback only |
 | `inductor_config.memory_planning = True` | Deep recursion on ROCm | Keep `False` |
 | `torch.cuda.synchronize()` (device-wide) | hipDeviceSynchronize is 3.7x more expensive than CUDA | `torch.cuda.current_stream().synchronize()` |
 | Triton GEMM kernels | 35-55% slower than rocBLAS on AMD | `max_autotune_gemm_backends = "ATEN"` |
 | Global weight preshuffling | Regresses small-M decode shapes | Threshold-based: only preshuffle when M >= threshold |
 | Graph-breaking around attention | ~10ms regression per break | Compile through attention ops |
+| Choosing STOP when target not met | Agent must exhaust all optimization phases | Run verification gate; only STOP after all phases or target achieved |
 
 ## Environment Variables (HIP Runtime)
 
@@ -279,3 +348,5 @@ export HSA_ENABLE_SDMA=1         # Enable SDMA engine
 - [Inductor Configuration](references/inductor-config.md) - Complete torch._inductor.config for ROCm
 - [Triton Kernels for AMD](references/triton-kernels.md) - RMSNorm, fused activations, AMD wavefront tuning
 - [Profiling Workflow](references/profiling-workflow.md) - rocprof, torch.profiler, Chrome tracing
+- [Verification Gate](references/verification-gate.py) - Programmatic target check script; run after each phase
+- [Long-Horizon Prompt Template](references/long-horizon-prompt-template.md) - Prompt template for overnight agent optimization runs
