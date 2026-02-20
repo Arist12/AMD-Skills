@@ -63,17 +63,29 @@ See [torch-compile-and-graphs.md](references/torch-compile-and-graphs.md).
 
 ## Workflow
 
-1. **Profile** — Use `torch.profiler` to generate a chrome trace (or `rocprofv3` for hardware counters). Identify the hottest kernels and classify them (GEMM / elementwise / attention / other).
+1. **Profile and categorize** — Use `torch.profiler` to generate a chrome trace. Categorize where time is spent: GEMM (linear layers, projections), attention, elementwise/normalization, kernel launch gaps, and other overhead. Compute the percentage each category contributes. This breakdown determines which optimizations will have impact.
 
-2. **Benchmark alternatives** — For each hot kernel category, benchmark the relevant alternatives listed above on your actual workload. Pick what performs best for your shapes and batch sizes.
+2. **Look for compute-reduction opportunities first** — Before optimizing kernels, check whether the workload is doing unnecessary compute. Common opportunities: skipping processing for masked/padding inputs, avoiding redundant tensor copies or expansions (e.g., `repeat_kv` for GQA), caching values that don't change across iterations.
 
-3. **Fuse operations** — Write Triton kernels for elementwise fusion targets. Fuse linear projections (QKV, Gate+Up) to reduce GEMM count.
+3. **Apply optimizations at the right layer** — Most compute in transformer models lives in the inner attention and MLP modules, not in the outer model wrapper. Optimizations (attention backend swaps, fused activations, projection fusion) must be applied inside those inner modules to have effect. Modifying only the outer wrapper or entry point will not meaningfully change latency.
 
-4. **Configure torch.compile** — Start with ROCm-safe inductor defaults. Compile through vendor ops to minimize graph breaks. Benchmark compile modes.
+4. **Benchmark alternatives for each hot category** — For each hot kernel category, benchmark the relevant alternatives listed above. When a technique regresses, diagnose *why* before giving up — for example, if aiter GEMM is slower, check whether tuned configs exist for your shapes (generate them if not); if preshuffling hurts, try gating it by input M-dimension rather than disabling entirely.
 
-5. **Capture CUDAGraph** (optional) — If kernel launch overhead is significant, try manual full-call CUDAGraph capture. Apply the Dynamo RNG patch first on ROCm.
+5. **Fuse operations** — Write Triton kernels for elementwise fusion targets. Fuse linear projections (QKV, Gate+Up) to reduce GEMM count. Apply fused weights after loading but before `torch.compile`.
 
-6. **Re-profile and iterate** — Measure again, find the next bottleneck, repeat.
+6. **Configure torch.compile** — Start with ROCm-safe inductor defaults (see reference). Compile through vendor ops to minimize graph breaks. Benchmark compile modes.
+
+7. **Capture CUDAGraph** (optional) — If kernel launch overhead is significant, try manual full-call CUDAGraph capture. Common blockers are solvable: `while` loops with data-dependent conditions can be refactored into fixed `for` loops; tensors created inside the loop can be pre-allocated as module buffers; the Dynamo RNG bug on ROCm has a known patch.
+
+8. **Compose and re-profile** — Apply optimizations incrementally and measure the cumulative effect. Different techniques target different bottlenecks (e.g., Triton for elementwise, rocBLAS for GEMM, aiter for attention) and are designed to compose — test them together, not only in isolation.
+
+## Common Pitfalls
+
+- **Shallow profiling**: Generating a trace and looking at "top 10 kernels" is not enough. Classify kernels by category (GEMM / attention / elementwise / other) and compute time percentages to understand which optimization category will have the highest impact.
+- **Testing only in isolation**: Testing one optimization at a time in a separate script and reverting each one that doesn't individually help misses that optimizations compose. A technique that shows 0% improvement alone may enable other techniques or reduce overhead that only matters in combination.
+- **Giving up on first failure**: When a technique causes regression, the right response is to diagnose and adjust, not revert and abandon. The technique may be correct but misconfigured (wrong shapes, missing tuned configs, applied too broadly).
+- **Treating blockers as dead ends**: "CUDAGraph doesn't support control flow" means "refactor the control flow," not "CUDAGraph is impossible." Most reported blockers for CUDAGraph on ROCm have known workarounds (loop refactoring, pre-allocating tensors, Dynamo RNG patch).
+- **Not modifying inner model layers**: If the optimization target is a transformer, the hottest code is in the attention and MLP modules (often in third-party libraries like `transformers`). Leaving these untouched and only changing the outer calling code will not produce meaningful speedups.
 
 ## Reference Files
 
