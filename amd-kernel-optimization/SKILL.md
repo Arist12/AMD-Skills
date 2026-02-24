@@ -53,9 +53,9 @@ See attention section in [gemm-and-linear.md](references/gemm-and-linear.md).
 
 | Alternative | What It Offers | Known ROCm Issues |
 |-------------|---------------|-------------------|
-| `torch.compile(mode="default")` | Safe baseline; Triton fusion for elementwise | — |
-| `torch.compile(mode="reduce-overhead")` | Adds CUDAGraph capture | CUDAGraph instability on ROCm; test carefully |
-| `torch.compile(mode="max-autotune")` | Benchmarks multiple backends per op | Longer compile; Triton GEMM autotuning may not help |
+| `torch.compile(mode="default")` | **Recommended first.** Enables Triton fusion for elementwise ops — often the single largest speedup on ROCm. Requires inductor overrides from system prompt (the container defaults to `max_autotune=True` which causes hangs). | Stable on ROCm with correct inductor config |
+| `torch.compile(mode="reduce-overhead")` | Adds CUDAGraph capture on top of `default` | **Depends on CUDAGraphs, which must be disabled on ROCm per system prompt rules.** Only attempt after `default` mode is confirmed working AND you intentionally re-enable inductor CUDAGraphs. Expect instability. |
+| `torch.compile(mode="max-autotune")` | Benchmarks multiple GEMM backends per op | Triggers Triton GEMM autotuning that hangs on ROCm; avoid unless you have verified specific shapes work |
 | **Manual CUDAGraph capture** | Capture full call as one graph | Needs Dynamo RNG patch on ROCm |
 | **Eager (no compile)** | No compilation overhead | Misses fusion opportunities |
 
@@ -73,7 +73,7 @@ See [torch-compile-and-graphs.md](references/torch-compile-and-graphs.md).
 
 5. **Fuse operations** — Write Triton kernels for elementwise fusion targets. Fuse linear projections (QKV, Gate+Up) to reduce GEMM count. Apply fused weights after loading but before `torch.compile`.
 
-6. **Configure torch.compile** — Start with ROCm-safe inductor defaults (see reference). Compile through vendor ops to minimize graph breaks. Benchmark compile modes.
+6. **Configure torch.compile** — Apply the mandatory inductor overrides from the system prompt (the container sets `max_autotune=True` by default, which causes hangs). Then use `mode="default"` — it enables Triton elementwise fusion and is the most impactful single optimization on ROCm. Treat `default` mode as a real optimization to benchmark, not just a baseline. Do NOT use `reduce-overhead` (requires CUDAGraphs, which are disabled) or `max-autotune` (triggers autotuning hangs) unless `default` is already confirmed working and you have a specific reason. Compile through vendor ops to minimize graph breaks.
 
 7. **Capture CUDAGraph** (optional) — If kernel launch overhead is significant, try manual full-call CUDAGraph capture. Common blockers are solvable: `while` loops with data-dependent conditions can be refactored into fixed `for` loops; tensors created inside the loop can be pre-allocated as module buffers; the Dynamo RNG bug on ROCm has a known patch.
 

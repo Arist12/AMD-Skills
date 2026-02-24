@@ -2,40 +2,41 @@
 
 ## torch.compile Mode Selection
 
-| Mode | What It Does | Known ROCm Considerations |
-|------|-------------|--------------------------|
-| `default` | Dynamo tracing + Triton codegen for elementwise fusion | Generally stable on ROCm; good starting point |
-| `reduce-overhead` | Adds CUDAGraph capture to reduce launch overhead | Uses CUDAGraphs internally; ROCm HIP graph support has known stability issues — test carefully on your workload |
-| `max-autotune` | Benchmarks multiple backends (including Triton GEMM) per op | Longer compile time; benchmark to see if the autotuning gains offset the compilation cost |
+**Use `mode="default"` on ROCm.** This is the recommended mode and often the single largest optimization.
+
+| Mode | What It Does | ROCm Status |
+|------|-------------|-------------|
+| `default` | Dynamo tracing + Triton codegen for elementwise fusion | **Recommended.** Stable and effective on ROCm with correct inductor config. |
+| `reduce-overhead` | Adds CUDAGraph capture on top of `default` | **Do not use** unless you have explicitly re-enabled inductor CUDAGraphs and verified stability. The mandatory inductor config (see below) disables CUDAGraphs, making this mode equivalent to `default` at best, or unstable at worst. |
+| `max-autotune` | Benchmarks multiple backends (including Triton GEMM) per op | **Avoid.** Triggers Triton GEMM autotuning that hangs on ROCm. |
 
 ```python
-is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
-
-# "default" is a safe starting point on ROCm; benchmark other modes for your workload
-compile_mode = "default" if is_rocm else "reduce-overhead"
-model = torch.compile(model, mode=compile_mode)
+# On ROCm, always use mode="default" with the inductor overrides below.
+# Do NOT use "reduce-overhead" (CUDAGraphs disabled) or "max-autotune" (hangs).
+model = torch.compile(model, mode="default")
 ```
 
-## Inductor Configuration for ROCm
+## Inductor Configuration for ROCm (mandatory)
 
-These settings are a reasonable **starting point** for ROCm. Adjust based on your profiling results.
+**IMPORTANT — container environment issue:** The AMD ROCm Docker container sets `inductor_config.max_autotune = True` at the system level. This is NOT the upstream PyTorch default (`False`). Without the override below, even `mode="default"` silently behaves like `max-autotune`, triggering Triton GEMM autotuning that hangs on ROCm. You **must** apply these overrides before any `torch.compile` call.
 
 ```python
 import torch._inductor.config as inductor_config
 import torch._dynamo.config as dynamo_config
 
-# GEMM backend: ATen (rocBLAS) as starting point.
-# Benchmark with max_autotune=True to see if Triton/hipBLASLt help for your shapes.
-inductor_config.max_autotune_gemm_backends = "ATEN"
+# CRITICAL: override container default (True → False) to prevent autotuning hangs.
+# Without this, mode="default" silently triggers max-autotune behavior.
 inductor_config.max_autotune = False
+inductor_config.max_autotune_gemm_backends = "ATEN"
 inductor_config.coordinate_descent_tuning = False
 
-# Fusion: enable for elementwise ops
+# Fusion: enable for elementwise ops (this is where mode="default" gets its speedup)
 inductor_config.epilogue_fusion = True
 inductor_config.pattern_matcher = True
 inductor_config.aggressive_fusion = False  # experiment: may help or hurt
 
-# Inductor CUDAGraphs: OFF as safe default on ROCm (can cause instability)
+# CUDAGraphs: OFF on ROCm (HIP graph support is unstable).
+# This also means mode="reduce-overhead" will not function as intended.
 inductor_config.triton.cudagraphs = False
 inductor_config.triton.cudagraph_trees = False
 
@@ -80,7 +81,7 @@ The `torch.ops` path lets Dynamo trace through the call without graph-breaking.
 
 ### Inductor-level CUDAGraphs
 
-Inductor's built-in graph capture (`reduce-overhead` mode) may be unstable on ROCm. HIP graph support varies by ROCm version — test on your specific setup.
+Inductor's built-in graph capture (`reduce-overhead` mode) is disabled by the mandatory inductor config (`triton.cudagraphs = False`). Do not re-enable without verifying HIP graph stability on your specific ROCm version. If you use `mode="reduce-overhead"` with CUDAGraphs disabled, it offers no benefit over `mode="default"`.
 
 ### Manual full-call CUDAGraph capture
 
