@@ -101,6 +101,7 @@ Each level builds on the previous. **Do NOT skip to Level 3+ without Level 2.**
 - **Not modifying inner model layers**: The hottest code is in attention and MLP modules, often in third-party libraries. Locate them: `python -c "import transformers; print(transformers.__file__)"` and edit directly.
 - **Testing only in isolation**: Optimizations compose. A technique showing 0% alone may enable others. Build incrementally — each new technique applied ON TOP of all previous ones.
 - **Reducing benchmark parameters**: Setting `WARMUP=0 ITERATIONS=1` gives meaningless numbers. Optimize the code, not the test.
+- **aiter tuned GEMM with no tuned configs**: The default config CSV ships empty. Without it, `gemm_a16w16` silently falls back to plain `F.linear` — no error, no crash, no benefit. Diagnose with `AITER_LOG_TUNED_CONFIG=1`; if you see "using torch solution:0", generate configs via `AITER_TUNE_GEMM=1` + aiter's `GemmTuner`, or fall back to `PYTORCH_TUNABLEOP_ENABLED=1`. See [references/gemm-and-linear.md](references/gemm-and-linear.md) for the full workflow.
 
 ## Reference Files
 

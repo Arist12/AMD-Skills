@@ -41,6 +41,46 @@ To add your own tuned shapes, append your CSV path:
 export AITER_CONFIG_GEMM_BF16="/path/to/aiter/configs/bf16_tuned_gemm.csv:/path/to/your/tuned_gemm.csv"
 ```
 
+### When Configs Are Missing (Silent Failure Mode)
+
+**The default tuned config CSV ships empty.** Without populated configs, `gemm_a16w16` silently falls back to plain `F.linear` for most shapes — **no error, no crash, no benefit**. This is the most common failure mode when applying aiter tuned GEMM: the monkey-patch appears to work, performance doesn't improve, and there's no obvious signal why.
+
+**Diagnose first:**
+```bash
+AITER_LOG_TUNED_CONFIG=1 python3 your_script.py 2>&1 | grep -E "not found tuned|using torch"
+```
+If you see `"not found tuned config ... will use default config!"` or `"using torch solution:0"`, configs are missing for those shapes. If nothing prints, check that `AITER_CONFIG_GEMM_BF16` points to a non-empty CSV.
+
+**Fix option 1 — Generate configs with aiter's built-in tuner (optimal):**
+
+aiter ships a `GemmTuner` in its `gradlib/` directory that benchmarks all available kernels per shape and selects the winner. Two-step workflow:
+
+```bash
+# Step 1: collect GEMM shapes from your actual workload (one inference pass is enough)
+AITER_TUNE_GEMM=1 python3 your_inference_script.py
+# → writes seen shapes to bf16_untuned_gemm.csv in aiter's configs/ directory
+
+# Find where aiter is installed and locate both the config file and tuner script.
+# In the standard docker environment, aiter is at /sgl-workspace/aiter:
+#   Untuned shapes: /sgl-workspace/aiter/aiter/configs/bf16_untuned_gemm.csv
+#   Tuner script:   /sgl-workspace/aiter/gradlib/gradlib/gemm_tuner.py
+# To locate dynamically in other environments:
+AITER_DIR=$(python3 -c "import aiter, os; print(os.path.dirname(aiter.__file__))")
+TUNER=$(find "$AITER_DIR/.." -name "gemm_tuner.py" 2>/dev/null | head -1)
+
+# Step 2: benchmark all kernels for collected shapes (5–30 min, requires GPU)
+python3 "$TUNER" \
+    --untune_file "$AITER_DIR/configs/bf16_untuned_gemm.csv" \
+    --out_file /tmp/my_tuned_gemm.csv
+
+# Step 3: apply results
+export AITER_CONFIG_GEMM_BF16=/tmp/my_tuned_gemm.csv
+```
+
+**Fix option 2 — Use TunableOp instead (simpler, no separate tuning run):**
+
+`PYTORCH_TUNABLEOP_ENABLED=1` (already in Level 1 env vars) auto-tunes GEMM via hipBLASLt on first run and caches results. It covers fewer kernel types than aiter's full tuner (no ASM/skinny kernels) but requires zero extra steps and is a solid fallback when tuning time is not available.
+
 ## Routing nn.Linear Through a Custom GEMM Backend
 
 ### Monkey-patch approach (zero model code changes)
