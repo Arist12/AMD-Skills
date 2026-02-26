@@ -141,6 +141,21 @@ output = activation(gate) * up
 
 Fuse weights **after** loading but **before** `torch.compile`.
 
+### Routing Fused Projections Through aiter Tuned GEMM
+
+Fusing projections changes the GEMM shape: N becomes the sum of the individual projection sizes (e.g., QKV fusion yields `N = D_q + D_k + D_v`). **Existing tuned configs for the individual projections do not cover the new fused shape** — generate configs for it using `AITER_TUNE_GEMM=1` with your workload after applying fusion (see "When Configs Are Missing" above).
+
+Also note: the `nn.Linear` monkey-patch only intercepts `nn.Linear.forward`. Fused weights stored as buffers and called via `F.linear` bypass it. Call `gemm_a16w16` directly for those:
+
+```python
+from aiter.tuned_gemm import gemm_a16w16
+
+# In forward(), replace F.linear(x, self._fused_qkv_weight) with:
+inp = x.view(-1, x.size(-1))
+qkv = gemm_a16w16(inp, self._fused_qkv_weight, bias=None, otype=x.dtype)
+qkv = qkv.view(*x.shape[:-1], qkv.shape[-1])
+```
+
 ## Weight Preshuffling (asm Kernel Fast Path)
 
 aiter's asm GEMM kernels on gfx950+ can use a pre-shuffled weight layout. Whether this helps or hurts depends on GEMM shape — benchmark with and without.
