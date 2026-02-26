@@ -1,203 +1,205 @@
-# torch.compile and CUDAGraph on ROCm
+# torch.compile and CUDAGraph on ROCm (Performance)
 
-## torch.compile Mode Selection
+## Step 0: Audit Environment Variables
 
-**Use `mode="default"` on ROCm.** This is the recommended mode and often the single largest optimization.
-
-| Mode | What It Does | ROCm Status |
-|------|-------------|-------------|
-| `default` | Dynamo tracing + Triton codegen for elementwise fusion | **Recommended.** Stable and effective on ROCm with correct inductor config. |
-| `reduce-overhead` | Adds CUDAGraph capture on top of `default` | **Do not use** unless you have explicitly re-enabled inductor CUDAGraphs and verified stability. The mandatory inductor config (see below) disables CUDAGraphs, making this mode equivalent to `default` at best, or unstable at worst. |
-| `max-autotune` | Benchmarks multiple backends (including Triton GEMM) per op | **Avoid.** Triggers Triton GEMM autotuning that hangs on ROCm. |
-
-```python
-# On ROCm, always use mode="default" with the inductor overrides below.
-# Do NOT use "reduce-overhead" (CUDAGraphs disabled) or "max-autotune" (hangs).
-model = torch.compile(model, mode="default")
+**Run this before your first torch.compile attempt:**
+```bash
+env | grep -iE 'TORCH|INDUCTOR|AUTOTUNE|COMPILE|TRITON|OMP|MKL' | sort
 ```
 
-## Inductor Configuration for ROCm (mandatory)
+| Red Flag | Problem | Fix |
+|---|---|---|
+| `TORCHINDUCTOR_MAX_AUTOTUNE=1` | Forces kernel search on every mode; 2-min → 15+ min hang | `unset TORCHINDUCTOR_MAX_AUTOTUNE` |
+| `TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1` | Same for pointwise | `unset TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE` |
+| `OMP_NUM_THREADS` too high | Compile workers contend for threads | Set to `nproc / 4` |
 
-**IMPORTANT — container environment issue:** The AMD ROCm Docker container sets `inductor_config.max_autotune = True` at the system level. This is NOT the upstream PyTorch default (`False`). Without the override below, even `mode="default"` silently behaves like `max-autotune`, triggering Triton GEMM autotuning that hangs on ROCm. You **must** apply these overrides before any `torch.compile` call.
+AMD Docker images often set `max_autotune` globally — the #1 cause of "compilation hangs."
+
+## Inductor Configuration (mandatory)
 
 ```python
 import torch._inductor.config as inductor_config
 import torch._dynamo.config as dynamo_config
 
-# CRITICAL: override container default (True → False) to prevent autotuning hangs.
-# Without this, mode="default" silently triggers max-autotune behavior.
+# Override container default (True → False) to prevent autotuning hangs
 inductor_config.max_autotune = False
 inductor_config.max_autotune_gemm_backends = "ATEN"
 inductor_config.coordinate_descent_tuning = False
 
-# Fusion: enable for elementwise ops (this is where mode="default" gets its speedup)
-inductor_config.epilogue_fusion = True
-inductor_config.pattern_matcher = True
-inductor_config.aggressive_fusion = False  # experiment: may help or hurt
-
-# CUDAGraphs: OFF on ROCm (HIP graph support is unstable).
-# This also means mode="reduce-overhead" will not function as intended.
+# CUDAGraphs: OFF (HIP graph support unstable)
 inductor_config.triton.cudagraphs = False
 inductor_config.triton.cudagraph_trees = False
 
-# Memory planning: OFF as safe default (known to cause recursion issues
-# with large graphs on ROCm). Enable and test if your graph is small.
+# Memory planning: OFF (recursion errors on ROCm with large graphs)
 inductor_config.memory_planning = False
 
-# Reorder for locality: generally helps memory access patterns
+# Fusion: enable (this is where mode="default" gets its speedup)
+inductor_config.epilogue_fusion = True
+inductor_config.pattern_matcher = True
 inductor_config.reorder_for_locality = True
 
-# Dynamo cache: increase for models with dynamic shapes (KV cache, variable seq len)
+# Dynamo cache (prevents recompilation storms with dynamic shapes)
 dynamo_config.cache_size_limit = 128
 ```
 
-## Compiling Through Vendor Ops
+Apply before any `torch.compile()` call.
 
-To get the best results from `torch.compile`, compile *through* vendor attention/GEMM ops rather than graph-breaking around them.
+## Mode Selection
 
-### Avoiding graph breaks
+Use `mode="default"` on ROCm. This is the recommended mode.
 
-Graph breaks split the compiled graph into multiple fragments, increasing kernel launch overhead. Common causes on ROCm:
-
-1. **Python-level vendor op wrappers** — Dynamo can't trace through Python control flow in vendor libraries
-2. **Explicit `torch._dynamo.disable`** — Wrapping ops in `@dynamo.disable` forces a graph break
-
-### Solution: use `torch.ops` path
-
-Register vendor ops as torch custom ops and call them via `torch.ops.*`:
+| Mode | ROCm Status |
+|---|---|
+| `default` | **Recommended.** Stable with correct inductor config. Enables Triton fusion for elementwise ops. |
+| `reduce-overhead` | CUDAGraphs disabled by config above → equivalent to `default`. Only attempt if you re-enable inductor CUDAGraphs. |
+| `max-autotune` | **Avoid.** Triggers Triton GEMM autotuning that hangs on ROCm. |
 
 ```python
-# Python wrapper — may cause graph break:
+model = torch.compile(model, mode="default")
+```
+
+## Graph Breaks: Find and Fix
+
+Graph breaks split the compiled graph → extra kernel launch overhead, prevents fusion. **Fix all breaks before proceeding with other optimizations.**
+
+### Finding breaks
+```bash
+TORCH_LOGS="graph_breaks" python3 your_script.py
+```
+
+### Common patterns and fixes
+
+| Pattern | Fix |
+|---|---|
+| `a, b, c, d = tensor.shape` (UNPACK_SEQUENCE — most common) | `h, w = tensor.shape[2], tensor.shape[3]` |
+| `if tensor.item() > 0:` (data-dependent control flow) | `torch.where(tensor > 0, true_val, false_val)` |
+| Class defined inside compiled region | Move class outside |
+| `[tensor[i] for i in range(n)]` | `tensor.unbind(0)` or `torch.split(...)` |
+| `while condition:` (dynamic loop) | `for step in range(fixed_count):` |
+| `tensor.item()` / `tensor.numpy()` | Keep on GPU, use tensor directly in torch ops |
+
+**After fixing, always verify:** `TORCH_LOGS="graph_breaks" python3 your_script.py`
+
+Search the codebase for the most common break: `grep -rn "= .*\.shape$" --include="*.py" src/`
+
+## Compiling Through Vendor Ops
+
+Use `torch.ops.*` path so Dynamo can trace through without graph-breaking:
+
+```python
+# BAD — Python wrapper may cause graph break:
 from aiter import flash_attn_func
 out = flash_attn_func(q, k, v)
 
-# Direct torch.ops path — compile-friendly:
+# GOOD — compile-friendly:
 out = torch.ops.aiter.mha_fwd.default(q, k, v, ...)[0]
 ```
 
-The `torch.ops` path lets Dynamo trace through the call without graph-breaking.
+## Manual CUDAGraph Capture
 
-## CUDAGraph on ROCm
+Since Inductor CUDAGraphs are disabled, capture manually when kernel launch overhead is high.
+Manual capture wraps the **entire inference pipeline** (not just `model.forward`) in one graph — often 2x+ speedup.
 
-### Inductor-level CUDAGraphs
+### The Dynamo RNG Patch (required before capture on ROCm)
 
-Inductor's built-in graph capture (`reduce-overhead` mode) is disabled by the mandatory inductor config (`triton.cudagraphs = False`). Do not re-enable without verifying HIP graph stability on your specific ROCm version. If you use `mode="reduce-overhead"` with CUDAGraphs disabled, it offers no benefit over `mode="default"`.
-
-### Manual full-call CUDAGraph capture
-
-Capturing an entire function call as one graph can reduce kernel launch overhead:
-
-```python
-import torch.cuda
-
-# 1. Warmup (must run with exact same shapes)
-for _ in range(5):
-    output = model_fn(input_tensors)
-
-# 2. Capture
-pool = torch.cuda.graphs.graph_pool_handle()
-graph = torch.cuda.CUDAGraph()
-with torch.cuda.graph(graph, pool=pool):
-    static_output = model_fn(input_tensors)
-
-# 3. Replay in loop
-for step in range(num_steps):
-    graph.replay()
-    result = static_output  # output aliases the captured memory
-```
-
-### The Dynamo RNG capture bug (ROCm-specific)
-
-**Problem:** If Dynamo (torch.compile) traces a new frame during graph capture, it calls `torch.cuda.get_rng_state()`, which queries the CUDA generator seed. ROCm disallows this during capture:
+ROCm forbids `torch.cuda.get_rng_state()` during stream capture:
 ```
 RuntimeError: Cannot call CUDAGeneratorImpl::current_seed during CUDA graph capture
 ```
 
-**Fix:** Patch Dynamo's `preserve_global_state` to skip CUDA RNG state during capture:
-
+**Fix:** Patch `preserve_global_state` to skip CUDA RNG during capture:
 ```python
-import torch._dynamo.convert_frame as _cf
+import functools, torch._dynamo.convert_frame as _cf
 
 def patch_dynamo_for_rocm_capture():
-    """Skip CUDA RNG get_state during graph capture on ROCm."""
-    import contextlib, functools, random as _py_random
+    if getattr(_cf, "_rocm_patched", False):
+        return
+    _cf._rocm_patched = True
 
     def _safe_preserve(fn):
         @functools.wraps(fn)
-        def _fn(*args, **kwargs):
-            guards = _cf.GlobalStateGuard()
-            prior_grad = torch.is_grad_enabled()
-
-            with torch._C._PreserveDispatchKeyGuard():
-                py_rng = _py_random.getstate()
-                torch_rng = torch.random.get_rng_state()
-
-                # KEY FIX: skip CUDA RNG if capturing
-                cuda_rng = None
-                if torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
-                    cuda_rng = torch.cuda.get_rng_state()
-
-                try:
-                    return fn(*args, **kwargs)
-                finally:
-                    torch._C._set_grad_enabled(prior_grad)
-                    _py_random.setstate(py_rng)
-                    torch.random.set_rng_state(torch_rng)
-                    if cuda_rng is not None:
-                        torch.cuda.set_rng_state(cuda_rng)
-
-        return _fn
+        def wrapper(*args, **kwargs):
+            rng = None
+            if torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
+                try: rng = torch.cuda.get_rng_state()
+                except Exception: pass
+            try: return fn(*args, **kwargs)
+            finally:
+                if rng is not None:
+                    try: torch.cuda.set_rng_state(rng)
+                    except Exception: pass
+        return wrapper
 
     _cf.preserve_global_state = _safe_preserve
 ```
 
-Call this patch **before** graph capture if using `torch.compile` + manual CUDAGraph together on ROCm.
+### Capture Pattern
+
+```python
+patch_dynamo_for_rocm_capture()
+compiled_model = torch.compile(model, mode="default")
+
+# 1. Warmup (triggers Inductor compilation)
+with torch.no_grad():
+    for _ in range(5): _ = compiled_model(static_input)
+torch.cuda.current_stream().synchronize()
+
+# 2. Capture full inference as one graph
+pool = torch.cuda.graphs.graph_pool_handle()
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph, pool=pool):
+    static_output = compiled_model(static_input)
+
+# 3. Replay — near-zero CPU overhead
+graph.replay()
+# Result updated in-place in static_output
+```
+
+### Fixing Dynamic Tensor Creation During Capture
+
+Error: `hipErrorStreamCaptureUnsupported` — `torch.tensor(...)`, `torch.ones(...)`, etc. inside forward.
+
+**Fix 1 — `register_buffer()` for constant shapes:**
+```python
+# In __init__:
+self.register_buffer("_static_mask", torch.ones(1, max_seq_len, dtype=torch.bool), persistent=False)
+# In forward — view, no allocation:
+mask = self._static_mask.expand(batch_size, -1)
+```
+
+**Fix 2 — `setattr()` caching for runtime-dependent tensors:**
+```python
+cache_key = (str(device), int(num_steps))
+cached = getattr(self, "_cached_schedule", None)
+if not isinstance(cached, dict) or cached.get("key") != cache_key:
+    t = torch.arange(num_steps, device=device, dtype=torch.float32)
+    setattr(self, "_cached_schedule", {"key": cache_key, "t": t})
+t_schedule = self._cached_schedule["t"]
+```
+
+**Fix 3 — Warm up before capture** so lazy allocations happen first.
+
+### Capture Rules
+- All inputs/outputs must be pre-allocated
+- No data-dependent control flow (use `for`, not `while`)
+- No CPU-GPU sync during capture
+- **HIP does NOT raise errors for illegal ops** — it silently produces wrong results. Always validate outputs.
+- Large graphs can segfault on HIP — try `@torch.compiler.disable` on largest submodule, or piecewise compilation
+- Memory growth with dynamic shapes: pad inputs to fixed shape before capture
+
+## Caching
+
+```bash
+export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_cache
+```
+
+First compile is slow (2-15 min on AMD). Subsequent runs reuse cache. Clear only if behavior is wrong after code changes.
 
 ## HIP Environment Variables
 
 ```bash
-# Async kernel launches (keep 0 for production; set 1 only for debugging)
-export HIP_LAUNCH_BLOCKING=0
-
-# Suppress verbose AMD logging
-export AMD_LOG_LEVEL=0
-
-# Enable HIP compilation cache (avoids recompilation on restart)
-export HIP_CACHE_ENABLED=1
-
-# PyTorch memory allocator tuning for ROCm
-# expandable_segments avoids fragmentation; useful for large models
+export HIP_LAUNCH_BLOCKING=0       # Keep 0 for production; 1 for debugging only
+export AMD_LOG_LEVEL=0             # Suppress logging
+export HIP_CACHE_ENABLED=1        # Avoid recompilation on restart
 export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
 ```
-
-## Profiling on ROCm
-
-### torch.profiler (chrome trace)
-
-```python
-with torch.profiler.profile(
-    activities=[
-        torch.profiler.ProfilerActivity.CPU,
-        torch.profiler.ProfilerActivity.CUDA,
-    ],
-    record_shapes=True,
-    with_stack=True,
-) as prof:
-    output = model_fn(input_tensors)
-
-prof.export_chrome_trace("trace.json")
-```
-
-Open `trace.json` in `chrome://tracing` or Perfetto to identify:
-- Hot kernels (longest wall-clock time)
-- Kernel launch gaps (CPU overhead between GPU kernels)
-- Memory copies (host-device transfers)
-
-For deeper hardware-level analysis, AMD also provides **`rocprofv3`** — a GPU profiler that collects hardware counters (occupancy, cache hit rates, memory bandwidth).
-
-### Inductor compile logging
-
-Wrap `torch._inductor.compile_fx.compile_fx` to log per-graph compilation timing, node counts, and op breakdowns. This helps identify:
-- How many sub-graphs Dynamo creates (more = more graph breaks)
-- Which ops are most common (optimization targets)
-- Compilation time bottlenecks
